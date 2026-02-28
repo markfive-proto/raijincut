@@ -1,0 +1,23 @@
+# YouTube Shorts Preset
+# 1080x1920, 9:16, max 60s, h264
+
+[video]
+width = 1080
+height = 1920
+aspect_ratio = "9:16"
+max_duration = 60
+codec = "h264"
+bitrate = "6M"
+fps = 30
+pixel_format = "yuv420p"
+
+[subtitle]
+font = "Arial"
+font_size = 48
+font_color = "#FFFFFF"
+position = "bottom"
+offset_y = 100
+outline_color = "#000000"
+outline_width = 2
+background_color = "#00000080"
+background_padding = 10

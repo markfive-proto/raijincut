@@ -1,0 +1,77 @@
+# Video encoding presets for raijincut
+# Usage: raijincut cut --preset <preset_name> input.mp4 -o output.mp4
+
+[high_quality]
+name = "High Quality"
+description = "Best quality, larger file size"
+video_codec = "libx264"
+audio_codec = "aac"
+video_bitrate = "5000k"
+audio_bitrate = "192k"
+crf = 18
+preset = "slow"
+profile = "high"
+
+[standard]
+name = "Standard"
+description = "Good quality, moderate file size"
+video_codec = "libx264"
+audio_codec = "aac"
+video_bitrate = "2500k"
+audio_bitrate = "128k"
+crf = 23
+preset = "medium"
+profile = "main"
+
+[fast]
+name = "Fast"
+description = "Smaller file, faster encoding"
+video_codec = "libx264"
+audio_codec = "aac"
+video_bitrate = "1500k"
+audio_bitrate = "96k"
+crf = 28
+preset = "fast"
+profile = "main"
+
+[web_optimized]
+name = "Web Optimized"
+description = "Optimized for web streaming"
+video_codec = "libx264"
+audio_codec = "aac"
+video_bitrate = "2000k"
+audio_bitrate = "128k"
+crf = 23
+preset = "medium"
+profile = "main"
+movflags = "+faststart"
+
+[social_square]
+name = "Social Square"
+description = "1080x1080 for Instagram/Facebook"
+width = 1080
+height = 1080
+video_codec = "libx264"
+audio_codec = "aac"
+crf = 23
+preset = "medium"
+
+[social_portrait]
+name = "Social Portrait"
+description = "1080x1920 for TikTok/Reels"
+width = 1080
+height = 1920
+video_codec = "libx264"
+audio_codec = "aac"
+crf = 23
+preset = "medium"
+
+[social_landscape]
+name = "Social Landscape"
+description = "1920x1080 for YouTube Shorts"
+width = 1920
+height = 1080
+video_codec = "libx264"
+audio_codec = "aac"
+crf = 23
+preset = "medium"

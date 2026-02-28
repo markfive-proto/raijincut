@@ -1,0 +1,23 @@
+# Twitter/X Preset
+# 1280x720, 16:9, max 140s, h264
+
+[video]
+width = 1280
+height = 720
+aspect_ratio = "16:9"
+max_duration = 140
+codec = "h264"
+bitrate = "5M"
+fps = 30
+pixel_format = "yuv420p"
+
+[subtitle]
+font = "Arial"
+font_size = 36
+font_color = "#FFFFFF"
+position = "bottom"
+offset_y = 60
+outline_color = "#000000"
+outline_width = 2
+background_color = "#00000080"
+background_padding = 8

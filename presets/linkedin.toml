@@ -1,0 +1,23 @@
+# LinkedIn Preset
+# 1080x1350, 4:5, max 300s, h264
+
+[video]
+width = 1080
+height = 1350
+aspect_ratio = "4:5"
+max_duration = 300
+codec = "h264"
+bitrate = "6M"
+fps = 30
+pixel_format = "yuv420p"
+
+[subtitle]
+font = "Arial"
+font_size = 44
+font_color = "#FFFFFF"
+position = "bottom"
+offset_y = 80
+outline_color = "#000000"
+outline_width = 2
+background_color = "#00000080"
+background_padding = 10
