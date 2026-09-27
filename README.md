@@ -1,84 +1,55 @@
-# ⚡ RaijinCut: Parallel Video Processing CLI
+# RaijinCut
 
-> *Named after Raijin, the Japanese god of thunder, lightning splits into multiple bolts, just like RaijinCut splits video work across parallel threads.*
+> Named after Raijin, the Japanese god of thunder.
 
-A hybrid Rust + Python CLI tool for video transcription, repurposing, and editing. Wraps FFmpeg, yt-dlp, and Python-based ML tools into a single, thunder-fast binary.
+A small Python CLI for short-form video work: download a reference, break it down (transcript, shots,
+transitions, pacing, audio, captions), and edit with direct ffmpeg calls (cut, crop, convert, burn
+captions, transcript-driven rough cut, platform repurpose).
 
-## Why Hybrid? (Rust + Python)
+Design rules:
+1. **No moviepy.** Every edit is one ffmpeg command.
+2. **No PyTorch.** Transcripts come from whisper.cpp (`whisper-cli`) or `mlx_whisper`. No API key is needed.
+3. **Low RAM.** Frames and audio are streamed from ffmpeg pipes one small chunk at a time (32 px gray
+   frames for the dissolve test, 160 px for scene scores, 10 ms audio hops). Full-resolution frames are
+   never loaded into Python.
 
-Most video CLI tools are written entirely in Python. RaijinCut takes a different approach, a **compiled Rust binary** orchestrates everything, calling Python only for ML/AI tasks where the Python ecosystem is essential.
+## Commands
 
-### What this gets you
-
-| Concern | Pure Python tools | RaijinCut (hybrid) |
-|---|---|---|
-| **CLI startup** | ~100ms+ interpreter overhead | Near-instant (compiled binary) |
-| **Parallel batch jobs** | GIL-limited; needs `multiprocessing` | OS-level threads, true parallelism |
-| **Distribution** | `pip install` + virtualenv + dependency hell | Single binary + Python for ML only |
-| **ML/AI features** | Native access | Full access (shells out to Python) |
-| **Adding new ffmpeg commands** | Slow subprocess wrapper in Python | Zero-cost `Command::new()` in Rust |
-| **Memory safety** | Runtime errors | Compile-time guarantees |
-
-### Two levels of parallelism
-
-1. **Across videos**, `batch-transcribe` processes N videos simultaneously using Rust's `std::thread` pool. Each thread spawns an independent Python subprocess, completely bypassing Python's GIL.
-2. **Within a single video**, the `transcribe` command runs Whisper transcription and speaker diarization as parallel threads, then merges results. This cuts transcription time nearly in half for diarized output.
-
-A pure-Python tool using `multiprocessing` can achieve similar parallelism, but with more overhead (process pickling, no shared memory) and significantly more boilerplate. RaijinCut's Rust layer makes parallelism trivial.
-
-## Features
-
-| Command | Description |
-|---------|-------------|
-| `transcribe` | Transcribe video to text with timestamps (OpenAI Whisper) |
-| `batch-transcribe` | Transcribe multiple videos in parallel from a URL list |
-| `probe` | Get video metadata (resolution, duration, codec, audio) |
+| Command | What it does |
+|---|---|
 | `download` | Download a video (YouTube, X, Facebook, LinkedIn) as mp4 + metadata JSON; optional browser cookies |
 | `analyze` | Break a video (file or URL) down: word-level transcript + SRT, shots and transitions, pacing, keyframes, contact sheet, vision notes, audio/SFX hits, caption style, `breakdown.json` + `breakdown.md` |
-| `cut` | Cut video segment by start/end timestamps (stream copy, instant) |
-| `crop` | Crop to aspect ratio (9:16, 16:9, 1:1, 4:5) with auto-centering |
-| `subtitle` | Burn SRT subtitles into video (styled, positioned) |
-| `convert` | Re-encode video with configurable CRF quality |
-| `pipeline` | Full end-to-end: download → transcribe → AI highlights → cut → filler removal → stitch → crop → subtitle |
-| `repurpose` | Simpler pipeline: download → cut → crop → scale → subtitle |
-| `rough-cut` | Remove filler word segments from video using SRT timing |
-| `presets` | List available platform presets |
+| `probe` | Duration, resolution, audio codec |
+| `cut` | Cut a segment by start/end (frame accurate, re-encodes) |
+| `crop` | Centre-crop to any `W:H` aspect ratio |
+| `convert` | Re-encode with a CRF quality |
+| `subtitle` | Burn SRT captions into a video (works on ffmpeg builds without libass) |
+| `rough-cut` | Transcript-driven cleanup: removes filler words, stutter repeats and long pauses |
+| `repurpose` | URL or file, optional clip range, crop + scale to a platform preset, optional captions |
+| `presets` | List platform presets |
 
-## Quick Start
-
-### Build
+## Install
 
 ```bash
-cargo build --release
-# Binary at target/release/raijincut
+uv tool install -e ~/Projects/raijincut      # or: pipx install -e ~/Projects/raijincut
+raijincut --help
 ```
 
-### Requirements
+Python 3.11+. The only Python dependency is Pillow (caption and contact-sheet drawing); `anthropic`
+is optional (`uv tool install -e '.[api]'`) for `--vision api`.
 
-| Dependency | Purpose | Install |
+| Tool | Needed for | Install |
 |---|---|---|
-| **FFmpeg** + **ffprobe** | All video/audio processing | `brew install ffmpeg` / `apt install ffmpeg` |
-| **yt-dlp** | Video downloading | `brew install yt-dlp` / `pip install yt-dlp` |
-| **whisper.cpp** (optional) | Word-level transcript for `analyze` | `brew install whisper-cpp` + a ggml model |
-| **Python 3.x** | ML scripts (transcription, subtitles, rough-cut) | Usually pre-installed |
-| **moviepy**, **pysubs2** | Subtitle burning, rough-cut editing | `pip install moviepy pysubs2` |
-| **OpenAI API key** | Whisper transcription | Set `OPENAI_API_KEY` env var |
-| **HF_TOKEN** (optional) | Speaker diarization (pyannote) | Set `HF_TOKEN` env var |
+| ffmpeg + ffprobe | everything | `brew install ffmpeg` |
+| yt-dlp | `download`, URLs in `analyze` / `repurpose` | `brew install yt-dlp` |
+| whisper.cpp + a ggml model, or mlx_whisper | transcripts (`analyze`, `rough-cut` without `--words`, `repurpose --subtitles`) | `brew install whisper-cpp` + e.g. `ggml-small.en.bin`; or `pip install mlx-whisper` |
 
-```bash
-pip install moviepy pysubs2 pillow openai
-```
+Set `RAIJINCUT_WHISPER_MODEL=/path/to/ggml-small.en.bin` once instead of passing `--whisper-model`.
+`RAIJINCUT_MLX_MODEL` picks the mlx model when whisper.cpp is not used.
 
 ## Usage
 
-### Probe video metadata
-
-```bash
-raijincut probe video.mp4
-# Output: File, Duration, Video resolution, Audio codec
-```
-
-### Download a video
+### Download
 
 ```bash
 raijincut download "https://youtube.com/shorts/..." -o ./downloads
@@ -120,14 +91,13 @@ Options and backends:
 |---|---|---|
 | Transcript | whisper.cpp (`whisper-cli -ml 1 -sow`) with `--whisper-model` / `RAIJINCUT_WHISPER_MODEL`; otherwise `mlx_whisper --word-timestamps` (`RAIJINCUT_MLX_MODEL` picks the model); otherwise skipped with a TODO | `whisper-cli` + a ggml model, or `mlx_whisper` |
 | Shots | ffmpeg `scene` score spikes = hard cuts (`--scene-threshold`, default 0.3); luma runs = fade through black / white flash; pixel blend test on 32 px frames = dissolves | ffmpeg |
-| Keyframes | ffmpeg; strips and contact sheet use Pillow (skipped without it) | ffmpeg, optional Pillow |
+| Keyframes | ffmpeg; strips and contact sheet use Pillow | ffmpeg, Pillow |
 | Vision | `--vision auto` uses the Claude API when `ANTHROPIC_API_KEY` is set (`pip install anthropic`, model `RAIJINCUT_VISION_MODEL`, default `claude-opus-5`), else a local ollama vision model (`RAIJINCUT_OLLAMA_MODEL`), else skips with a TODO. `--vision claude-cli` uses the local `claude` CLI (your Claude Code login) instead. Keys come from the environment only | one of the above |
 | Audio | ffmpeg `ebur128` loudness; 10 ms envelopes in three bands (full, >3 kHz, <150 Hz) for SFX hits; noise floor vs median for a music bed guess | ffmpeg |
 | Captions | Burned-in caption style aggregated from the vision pass | a vision backend |
-| Summary | Heuristic hook/beats/what-to-steal always; with `api` or `claude-cli` also an LLM pass for beats, format formula and what to steal (`--no-summary` in `python/analyze.py` skips it) | optional |
+| Summary | Heuristic hook/beats/what-to-steal always; with `api` or `claude-cli` also an LLM pass for beats, format formula and what to steal (`--no-summary` skips it) | optional |
 
-Only stdlib Python is required (plus optional Pillow and `anthropic`). Run `python3 python/test_analyze.py`
-for the self-check of the shot, pacing, caption-grouping and onset logic.
+Memory stays flat with video length: scene scores come from a 160 px ffmpeg pass, the dissolve test keeps only a one-second window of 32 px gray frames, and audio envelopes are read 10 ms at a time. On the 59 s sample, Python peaked at about 55 MB; the biggest child process is whisper-cli with its model.
 
 #### `breakdown.json` schema (version 1)
 
@@ -215,183 +185,75 @@ Heuristics worth knowing: SFX hits are level jumps, so speech plosives and sibil
 the median level, so a noisy room can read as music. Detected transitions come from pixels; the vision
 pass gives a second opinion in `vision.transition_in`.
 
-### Transcribe with timestamps
+### Rough cut (filler words, repeats, pauses)
 
 ```bash
-# Basic transcription
-raijincut transcribe "https://youtube.com/watch?v=..." -o transcript.md
-
-# With speaker diarization (runs transcription + diarization in parallel)
-raijincut transcribe "https://youtube.com/watch?v=..." -o transcript.md -d
+raijincut rough-cut talk.mp4 -o clean.mp4                      # transcribes first
+raijincut rough-cut talk.mp4 -o clean.mp4 --words words.json   # reuse a word-timed transcript
+raijincut rough-cut talk.mp4 -o clean.mp4 --srt talk.srt       # or an SRT (word times spread per cue)
+raijincut rough-cut talk.mp4 -o clean.mov --pause 0.8          # .mov/.mkv keep PCM audio for further processing
 ```
 
-### Batch transcribe (parallel)
+Removes filler words (`um`, `uh`, `erm`, `ah`, `hmm`, BM `err`/`emm`/`eh`, ZH `嗯`/`呃`/`额`), stutter repeats
+(`we we`, `I think I think`) and pauses longer than `--pause` seconds, then joins the kept ranges in one
+ffmpeg trim/concat pass. Words that are also real words (`like`, `actually`, `lah`) are never cut.
+`--words` takes `{"words": [{"w" or "text", "start", "end"}]}` (the `analyze` transcript.json works).
+
+Next to the output: `<name>.edits.json` (keep ranges, every edit with its reason, words retimed to the
+new timeline) and `<name>.srt` (captions on the new timeline). This is the single rough-cut
+implementation: `npm run cleanup` in solopreneur's video-studio calls it, then adds denoise, loudness and
+a ducked music bed.
+
+### Cut, crop, convert, captions
 
 ```bash
-# Create a file with one URL per line
-cat > urls.txt << 'EOF'
-https://youtube.com/watch?v=VIDEO1
-https://youtube.com/watch?v=VIDEO2
-https://youtube.com/watch?v=VIDEO3
-https://youtube.com/watch?v=VIDEO4
-EOF
-
-# Process 4 videos concurrently
-raijincut batch-transcribe urls.txt -o ./transcripts -j 4
-
-# With speaker diarization on all videos
-raijincut batch-transcribe urls.txt -o ./transcripts -d -j 4
-```
-
-Lines starting with `#` are ignored, so you can comment out URLs in the list file.
-
-### Cut, crop, convert
-
-```bash
-# Cut a segment (start to end timestamp, stream copy = instant)
+raijincut probe video.mp4
 raijincut cut video.mp4 -s 00:00:30 -e 00:02:00 -o clip.mp4
-
-# Crop to vertical (9:16), auto-centers the crop region
-raijincut crop video.mp4 -o vertical.mp4 -a 9:16
-
-# Re-encode with quality setting (CRF 0–51, lower = better)
+raijincut crop video.mp4 -a 9:16 -o vertical.mp4
 raijincut convert input.mp4 -o output.mp4 -c 18
+raijincut subtitle video.mp4 --srt subs.srt -o final.mp4 [-p shorts]
 ```
 
-### Burn subtitles
+`subtitle` draws each cue with Pillow (white text, black outline, bottom of the frame; `-p <preset>`
+uses that preset's `[subtitle]` size, colours and offset) and burns them with a single ffmpeg overlay,
+so it works on ffmpeg builds without libass or drawtext.
+
+### Repurpose for a platform
 
 ```bash
-raijincut subtitle video.mp4 --srt subs.srt -o final.mp4
-```
-
-Subtitles are rendered with white text, black stroke, positioned at the bottom of the frame.
-
-### Remove filler words
-
-```bash
-raijincut rough-cut video.mp4 --srt transcript.srt -o clean.mp4
-```
-
-Detects and removes segments where every word is a filler (um, uh, er, ah, like, basically, actually, literally, honestly, okay, right, I mean). Adjacent segments are merged with small padding to avoid jarring cuts.
-
-### Pipeline: AI-powered highlight reels
-
-The `pipeline` command is the full end-to-end workflow. Give it a YouTube URL and a preset, and it will:
-
-1. Download the video
-2. Transcribe + diarize (in parallel)
-3. **AI highlight selection**, sends transcript to GPT-4o-mini to pick 3-5 compelling segments (60-90s total)
-4. Cut highlight segments (stream copy, instant)
-5. Remove filler words from each clip
-6. Stitch clips with transitions (crossfade, wipeleft, etc.)
-7. Crop + scale to platform format
-8. Burn styled subtitles + fade effects
-
-```bash
-# Create a 60-90s highlight reel for Instagram Reels
-raijincut pipeline "https://youtube.com/watch?v=..." -p reels -o ./output
-
-# With a specific transition style
-raijincut pipeline "https://youtube.com/watch?v=..." -p reels -t crossfade -o ./output
-
-# Process multiple videos
-raijincut pipeline "URL1" "URL2" -p tiktok -o ./output
-```
-
-If the OpenAI API key is not set, highlight selection falls back to keyword-based scoring (no AI required).
-
-### Repurpose for social media
-
-Simpler pipeline, downloads the video, cuts a clip, crops to the platform's aspect ratio, scales to target resolution, and optionally burns subtitles:
-
-```bash
-# Repurpose a YouTube video for TikTok with subtitles
-raijincut repurpose "https://youtube.com/watch?v=..." \
-  -p tiktok -c 00:00:30-00:02:00 --subtitles -o tiktok_clip.mp4
-
-# Repurpose for Instagram Reels (no subtitles)
-raijincut repurpose "https://youtube.com/watch?v=..." \
-  -p reels -c 00:01:00-00:02:00 -o reel.mp4
-
-# See all available presets
+raijincut repurpose "https://youtube.com/watch?v=..." -p tiktok -c 00:00:30..00:01:00 --subtitles -o tiktok.mp4
+raijincut repurpose talk.mp4 -p reels -o reel.mp4
 raijincut presets
 ```
 
-## Platform Presets
+One encode for clip + crop + scale + fps; `--subtitles` transcribes the result and burns captions in the
+preset's style.
 
-Presets are TOML files in `presets/` that define resolution, aspect ratio, codec, and duration limits per platform:
+## Platform presets
 
-| Preset | Resolution | Aspect | FPS | Max Duration |
+TOML files in `raijincut/presets/` define resolution, aspect ratio, fps, duration limit and caption style:
+
+| Preset | Resolution | Aspect | FPS | Max duration |
 |--------|-----------|--------|-----|-------------|
 | tiktok | 1080x1920 | 9:16 | 30 | 180s |
 | reels | 1080x1920 | 9:16 | 30 | 90s |
 | shorts | 1080x1920 | 9:16 | 30 | 60s |
-| linkedin | 1080x1350 | 4:5 | 30 | - |
+| linkedin | 1080x1350 | 4:5 | 30 | 300s |
 | twitter | 1280x720 | 16:9 | 30 | 140s |
-| square | 1080x1080 | 1:1 | 30 | - |
+| square | 1080x1080 | 1:1 | 30 | 60s |
 
-You can add custom presets by creating a new TOML file in `presets/`.
-
-## Architecture
+## Layout
 
 ```
 raijincut/
-├── src/main.rs              # Rust CLI, argument parsing, process orchestration,
-│                             #   threading, and all video processing commands
-├── python/
-│   ├── analyze.py           # `analyze`: transcript, shots, keyframes, vision, audio, breakdown
-│   ├── test_analyze.py      # self-check for analyze.py
-│   ├── transcribe_only.py   # Whisper transcription (OpenAI API)
-│   ├── diarize_only.py      # Speaker diarization (pyannote)
-│   ├── merge_transcript.py  # Merge transcription + diarization output
-│   ├── video_transcribe.py  # Full transcription pipeline with chunking
-│   ├── highlight_selector.py# AI highlight selection (keyword + GPT-4o-mini)
-│   ├── video_repurpose.py   # Advanced repurposing pipeline
-│   ├── filler_remover.py    # Audio + transcript filler analysis
-│   ├── ai_filler_decider.py # AI-powered filler decisions (OpenAI)
-│   ├── transcript_filler.py # Transcript filler word detection
-│   ├── speaker_detector.py  # Speaker diarization (pyannote/whisperx)
-│   ├── audio_analysis.py    # Silence detection
-│   ├── video_format.py      # Format conversion utilities
-│   ├── video_transitions.py # Transition effects (xfade)
-│   └── fetch_metadata.py    # Video metadata fetching
-├── presets/                  # Platform preset configs (TOML)
-│   ├── tiktok.toml
-│   ├── reels.toml
-│   ├── shorts.toml
-│   ├── linkedin.toml
-│   ├── twitter.toml
-│   ├── square.toml
-│   └── default.toml
-├── Cargo.toml               # Rust dependencies (clap, serde, toml, tempfile)
-└── CLAUDE.md                # AI assistant instructions
+├── cli.py        # argparse entry point; download, probe, cut, crop, convert, subtitle, repurpose, presets
+├── analyze.py    # analyze: transcript, shots, keyframes, vision, audio, breakdown (+ shared SRT/whisper helpers)
+├── roughcut.py   # rough-cut: plan edits from a transcript, one ffmpeg trim/concat pass
+└── presets/      # platform presets (TOML)
+tests/test_raijincut.py   # one self-check per command on ffmpeg lavfi samples
 ```
 
-### How it works
-
-The Rust binary is the single entry point. It uses [clap](https://docs.rs/clap) for argument parsing and dispatches to handler functions that:
-
-1. **For simple operations** (cut, crop, convert, probe, download), directly invoke `ffmpeg`/`ffprobe`/`yt-dlp` via `std::process::Command`
-2. **For ML operations** (transcribe, rough-cut, subtitle), shell out to Python scripts or embed Python code inline
-3. **For pipelines** (pipeline, repurpose), chain multiple steps sequentially, with the `pipeline` command adding AI highlight selection and multi-clip stitching with transitions
-4. **For batch work** (batch-transcribe), spawn OS threads that each run independent processing pipelines
-
-The binary finds `python/` and `presets/` in the current directory, next to the executable, or in the source checkout it was built from, so it works from any directory.
-
-## Standalone Python Scripts
-
-The Python scripts in `python/` can also be used independently for more control:
-
-```bash
-# Transcribe with chunking for long videos
-python3 python/video_transcribe.py "URL" -o ./transcripts
-
-# Full repurpose with auto-highlight detection
-python3 python/video_repurpose.py "URL" --auto --subtitles --format reels
-
-# Speaker diarization (requires HF_TOKEN)
-python3 python/speaker_detector.py video.mp4
-```
+Tests: `python3 tests/test_raijincut.py` (or `python -m pytest tests`). No network, whisper or vision needed.
 
 ## License
 

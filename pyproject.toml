@@ -1,0 +1,23 @@
+[project]
+name = "raijincut"
+version = "0.2.0"
+description = "Video CLI: download, analyze reference videos, and edit with direct ffmpeg calls"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = ["Pillow>=10.1"]
+
+[project.optional-dependencies]
+api = ["anthropic"]
+
+[project.scripts]
+raijincut = "raijincut.cli:main"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["raijincut"]
+
+[tool.setuptools.package-data]
+raijincut = ["presets/*.toml"]
