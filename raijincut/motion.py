@@ -401,9 +401,12 @@ def transition(video, b, i, out, info, onsets, half=0.5, wfps=30, cell=160, cols
     sp = [spectra(x) for x in g]
     mot = [(0.0, 0.0, 0.0, 0.0)] + [global_motion(x, y) for x, y in zip(sp, sp[1:])]
     sh = [sharpness(x) for x in g]
-    around = [k for k in range(max(1, c - 3), min(len(g), c + 4)) if k != c]
-    speed = max((math.hypot(mot[k][0], mot[k][1]) / N for k in around if mot[k][3] >= 0.05), default=0.0)
-    zoom = max((abs(mot[k][2]) for k in around), default=0.0)
+    # the pair that straddles the cut is garbage for motion; it is the biggest jump next to the expected frame
+    cut_pair = max(range(max(1, c - 2), min(len(g), c + 3)), key=lambda k: d[k], default=c)
+    around = [k for k in range(max(1, c - 3), min(len(g), c + 4)) if k != cut_pair and mot[k][3] >= 0.05]
+    second = lambda xs: sorted(xs)[-2] if len(xs) >= 2 else 0.0   # needs two pairs, so one bad pair cannot decide
+    speed = second([math.hypot(mot[k][0], mot[k][1]) / N for k in around])
+    zoom = second([abs(mot[k][2]) for k in around])
     # sharpness dip next to the cut, each side against its own calm frames (two shots rarely share a sharpness)
     ratio = lambda near_, calm: min(near_) / statistics.median(calm) if near_ and statistics.median(calm) > 1 else 1.0
     blur = min(ratio(sh[max(0, c - 3):c], sh[:5]), ratio(sh[c:c + 4], sh[-5:]))
