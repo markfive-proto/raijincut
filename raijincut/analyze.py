@@ -1,15 +1,14 @@
-#!/usr/bin/env python3
 """Break a video down into transcript, shots, keyframes, vision notes, audio hits
-and captions, then write breakdown.json + breakdown.md.
+and captions, then write breakdown.json + breakdown.md. Entry point: `raijincut analyze`.
 
-Stdlib only. Pillow is optional (contact sheet and per-shot strips).
-The `anthropic` SDK is optional (only for --vision api).
-
-Usage: python3 analyze.py VIDEO -o OUT_DIR [--meta download.json] [--whisper-model ggml.bin]
-       [--scene-threshold 0.3] [--vision auto|api|ollama|claude-cli|none]
+Memory: frames and audio are streamed from ffmpeg pipes one small chunk at a time (32 px gray
+frames, 10 ms audio hops). Nothing holds the whole video or full-res frames in memory.
+Pillow draws strips and the contact sheet. The `anthropic` SDK is optional (only for --vision api).
 """
-import argparse, base64, datetime, json, math, os, re, shutil, statistics, subprocess, sys, tempfile, urllib.request, wave
+import base64, datetime, json, math, os, re, shutil, statistics, subprocess, sys, tempfile, urllib.request
 from array import array
+from collections import deque
+from itertools import islice
 
 SCHEMA_VERSION = 1
 SR = 16000          # analysis sample rate
@@ -79,6 +78,21 @@ def write_srt(cues, path):
             f.write(f"{i}\n{srt_time(c['start'])} --> {srt_time(c['end'])}\n{c['text']}\n\n")
 
 
+def parse_srt(path):
+    """[(start, end, text)] from an SRT file."""
+    def secs(t):
+        h, m, rest = t.strip().replace(".", ",").split(":")
+        sec, ms = rest.split(",")
+        return int(h) * 3600 + int(m) * 60 + int(sec) + int(ms) / 1000
+    cues = []
+    for block in re.split(r"\n\s*\n", open(path, encoding="utf-8").read().replace("\r", "").strip()):
+        lines = block.split("\n")
+        if len(lines) >= 3 and "-->" in lines[1]:
+            a, b = lines[1].split("-->")
+            cues.append((secs(a), secs(b), "\n".join(lines[2:])))
+    return cues
+
+
 def transcribe(wav, whisper_model, tmp):
     """Returns (backend, language, words). Prefers whisper.cpp, then mlx_whisper."""
     if whisper_model and shutil.which("whisper-cli"):
@@ -112,6 +126,13 @@ def transcribe(wav, whisper_model, tmp):
     return None, None, []
 
 
+def transcribe_video(video, whisper_model, tmp):
+    """16 kHz mono wav from any media file, then transcribe(). Returns (backend, language, words)."""
+    wav = os.path.join(tmp, "audio.wav")
+    run(["ffmpeg", "-y", "-v", "error", "-i", video, "-vn", "-ac", "1", "-ar", str(SR), wav])
+    return transcribe(wav, whisper_model, tmp)
+
+
 # ---------------------------------------------------------------- shots
 
 def frame_stats(video, tmp):
@@ -135,38 +156,59 @@ def frame_stats(video, tmp):
     return frames
 
 
+def stream(cmd, chunk):
+    """Yield fixed-size chunks from a command's stdout, one at a time."""
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        while len(buf := p.stdout.read(chunk)) == chunk:
+            yield buf
+    finally:
+        p.stdout.close()
+        p.kill()
+        p.wait()
+
+
 def thumbs(video, size=32):
-    """Every frame as size x size gray bytes (about 1 KB per frame)."""
-    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", video, "-an", "-vf", f"scale={size}:{size},format=gray",
-                          "-f", "rawvideo", "-"], capture_output=True).stdout
-    n = size * size
-    return [raw[i:i + n] for i in range(0, len(raw) - n + 1, n)]
+    """Every frame as size x size gray bytes (1 KB), streamed one frame at a time."""
+    return stream(["ffmpeg", "-v", "error", "-i", video, "-an", "-vf", f"scale={size}:{size},format=gray",
+                   "-f", "rawvideo", "-"], size * size)
 
 
 def mad(a, b):
     return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
 
 
-def find_dissolves(g, fps, taken, step=2):
+def find_dissolves(frames, fps, taken, step=2):
     """A crossfade's middle frame is the average of the frames either side of it; fast motion is not.
     ffmpeg's scene score stays near 0 during a steady crossfade, so this looks at pixels instead.
+    `frames` is any iterable of gray thumbnails; only a 2*K+1 frame window is kept (K = 0.5 s).
     Returns [(t, d_ab)] for windows of 0.3-1.0 s that contain no hard cut."""
+    ks = sorted({max(2, round(fps * h)) for h in (0.15, 0.3, 0.5)})
+    win = deque(maxlen=2 * ks[-1] + 1)   # frames n-2K .. n
+    steps = deque(maxlen=2 * ks[-1])     # mad(frame i, frame i+1) over the same window
     found = []
-    for k in sorted({max(2, round(fps * h)) for h in (0.15, 0.3, 0.5)}):
-        for c in range(k, len(g) - k, step):
+    for n, f in enumerate(frames):
+        if win:
+            steps.append(mad(win[-1], f))
+        win.append(f)
+        for ki, k in enumerate(ks):
+            c = n - k                     # centre of a window that ends at this frame
+            if c < k or (c - k) % step:
+                continue
             t = c / fps
             if any(abs(t - x) <= k / fps + 0.1 for x in taken):
                 continue
-            a, m, b = g[c - k], g[c], g[c + k]
+            a, m, b = win[-1 - 2 * k], win[-1 - k], f
             d_ab = mad(a, b)
             if d_ab < 20:
                 continue
-            steps = max(mad(g[i], g[i + 1]) for i in range(c - k, c + k))
+            biggest_step = max(islice(reversed(steps), 2 * k))
             err = sum(abs(z - (x + y) / 2) for x, y, z in zip(a, b, m)) / len(a)
-            if err < 0.2 * d_ab and steps < 0.35 * d_ab:
-                found.append((t, d_ab))
+            if err < 0.2 * d_ab and biggest_step < 0.35 * d_ab:
+                found.append((ki, c, t, d_ab))
+    found.sort()                          # by window size, then time: stable tie order for picking
     picked = []
-    for t, d in sorted(found, key=lambda f: -f[1]):
+    for _, _, t, d in sorted(found, key=lambda f: -f[3]):
         if all(abs(t - p) > 0.5 for p, _ in picked):
             picked.append((t, d))
     return sorted(picked)
@@ -178,7 +220,7 @@ def detect_boundaries(frames, fps, thr=0.3, min_shot=0.25, g=None):
     - cut: a single-frame scene-score spike >= thr.
     - fade_black / fade_white: a run of near-black/near-white frames; boundary at its middle.
       Called a fade when luma ramps over >= 3 frames into the run, else cut_to_black/flash.
-    - dissolve: pixel blend test on gray thumbnails `g` (see find_dissolves).
+    - dissolve: pixel blend test on gray thumbnails `g`, any iterable (see find_dissolves).
     ponytail: fixed heuristic thresholds; the vision pass double-checks every transition.
     """
     b = []
@@ -217,7 +259,7 @@ def detect_boundaries(frames, fps, thr=0.3, min_shot=0.25, g=None):
         if s[i] >= thr and s[i] >= s[i - 1] and (i + 1 >= n or s[i] >= s[i + 1]):
             add(frames[i]["t"], "cut", round(min(1.0, 0.5 + s[i]), 2), s[i])
 
-    if g:
+    if g is not None:
         for t, d in find_dissolves(g, fps, [x["t"] for x in b]):
             add(t, "dissolve", 0.6, d / 255)
     return sorted(b, key=lambda x: x["t"])
@@ -337,20 +379,14 @@ def strips(shots, out, h=320):
 
 # ---------------------------------------------------------------- audio
 
-def pcm(video, af=None):
+def envelope_db(video, af=None):
+    """10 ms RMS envelope in dBFS, streamed from ffmpeg one hop at a time."""
     cmd = ["ffmpeg", "-v", "error", "-i", video, "-vn", "-ac", "1", "-ar", str(SR)]
     if af:
         cmd += ["-af", af]
-    raw = subprocess.run(cmd + ["-f", "s16le", "-"], capture_output=True).stdout
-    a = array("h")
-    a.frombytes(raw[: len(raw) // 2 * 2])
-    return a
-
-
-def envelope_db(a):
     env = []
-    for i in range(0, len(a) - HOP + 1, HOP):
-        seg = a[i:i + HOP]
+    for buf in stream(cmd + ["-f", "s16le", "-"], HOP * 2):
+        seg = array("h", buf)
         rms = math.sqrt(sum(x * x for x in seg) / HOP)
         env.append(20 * math.log10(rms / 32768 + 1e-9))
     return env
@@ -392,12 +428,12 @@ def audio_analysis(video, bounds):
     """Loudness, music-bed guess and SFX hit candidates aligned to cuts.
     ponytail: level-based heuristics, no source separation. Speech plosives and sibilants can pass as
     hits, so trust `aligned_to_cut` hits most. Add a music/SFX classifier if these misfire."""
-    full = envelope_db(pcm(video))
+    full = envelope_db(video)
     if not full:
         return {"status": "no_audio"}
     hits = []
     for band, af, rise_db, label in SFX_BANDS:
-        env = full if af is None else envelope_db(pcm(video, af))
+        env = full if af is None else envelope_db(video, af)
         for i, rise, lvl in onsets(env, rise_db=rise_db):
             t = i * HOP / SR
             if any(abs(t - h["t"]) < 0.08 for h in hits):
@@ -678,25 +714,15 @@ def markdown(b):
 
 # ---------------------------------------------------------------- main
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("video")
-    ap.add_argument("-o", "--out", default=".")
-    ap.add_argument("--meta", help="metadata JSON written by `raijincut download` (default: <video>.json if present)")
-    ap.add_argument("--whisper-model", default=os.environ.get("RAIJINCUT_WHISPER_MODEL"),
-                    help="whisper.cpp ggml model (env RAIJINCUT_WHISPER_MODEL); falls back to mlx_whisper")
-    ap.add_argument("--scene-threshold", type=float, default=0.3)
-    ap.add_argument("--vision", default="auto", choices=["auto", "api", "ollama", "claude-cli", "none"])
-    ap.add_argument("--no-summary", action="store_true", help="skip the LLM summary call")
-    a = ap.parse_args()
-
-    video = os.path.abspath(a.video)
+def analyze(video, out_dir=".", whisper_model=None, vision="auto", scene_threshold=0.3, no_summary=False, meta_path=None):
+    """Write <out_dir>/<slug>/breakdown.json + .md and friends. Returns that folder."""
+    video = os.path.abspath(video)
     if not os.path.exists(video):
         sys.exit(f"Video not found: {video}")
-    meta_path = a.meta or os.path.splitext(video)[0] + ".json"
+    meta_path = meta_path or os.path.splitext(video)[0] + ".json"
     meta = json.load(open(meta_path)) if os.path.exists(meta_path) else None
     slug = slugify(os.path.splitext(os.path.basename(video))[0])
-    out = os.path.join(os.path.abspath(a.out), slug)
+    out = os.path.join(os.path.abspath(out_dir), slug)
     os.makedirs(out, exist_ok=True)
     tmp = tempfile.mkdtemp(prefix="raijincut-")
     log(f"Analyzing {video}\n  -> {out}")
@@ -708,10 +734,8 @@ def main():
     log("[1/6] transcript")
     words, backend, lang, status = [], None, None, "skipped"
     if info["has_audio"]:
-        wav = os.path.join(tmp, "audio.wav")
-        run(["ffmpeg", "-y", "-v", "error", "-i", video, "-vn", "-ac", "1", "-ar", str(SR), wav])
         try:
-            backend, lang, words = transcribe(wav, a.whisper_model, tmp)
+            backend, lang, words = transcribe_video(video, whisper_model, tmp)
             status = "ok" if backend else "skipped"
         except Exception as e:
             log(f"  transcription failed: {e}")
@@ -729,12 +753,12 @@ def main():
 
     log("[2/6] shots")
     frames = frame_stats(video, tmp)
-    bounds = detect_boundaries(frames, info["fps"] or 30, a.scene_threshold,
+    bounds = detect_boundaries(frames, info["fps"] or 30, scene_threshold,
                                g=thumbs(video))
     shots = build_shots(bounds, info["duration_s"])
     for s in shots:
         s["spoken"] = " ".join(w["text"] for w in words if s["start"] <= w["start"] < s["end"])
-    b["shots"] = {"scene_threshold": a.scene_threshold, "boundaries": bounds, "list": shots}
+    b["shots"] = {"scene_threshold": scene_threshold, "boundaries": bounds, "list": shots}
     b["pacing"] = pacing(shots, info["duration_s"])
     log(f"  {len(shots)} shots, {b['pacing']['cuts_per_10s']} cuts per 10 s")
 
@@ -747,7 +771,7 @@ def main():
     b["audio"] = audio_analysis(video, bounds) if info["has_audio"] else {"status": "no_audio"}
 
     log("[5/6] vision")
-    vb = pick_backend(a.vision)
+    vb = pick_backend(vision)
     b["vision"] = {"backend": vb, "status": "skipped" if vb == "none" else "ok"}
     if vb == "none":
         b["vision"]["todo"] = ("no vision backend: set ANTHROPIC_API_KEY (+ pip install anthropic), run an "
@@ -760,7 +784,7 @@ def main():
 
     log("[6/6] summary")
     b["summary"] = heuristic_summary(b)
-    if vb in ("api", "claude-cli") and not a.no_summary:
+    if vb in ("api", "claude-cli") and not no_summary:
         try:
             b["summary"]["llm"] = llm_summary(vb, b, out)
         except Exception as e:
@@ -769,7 +793,4 @@ def main():
     open(os.path.join(out, "breakdown.md"), "w").write(markdown(b))
     shutil.rmtree(tmp, ignore_errors=True)
     log(f"Done: {os.path.join(out, 'breakdown.md')}")
-
-
-if __name__ == "__main__":
-    main()
+    return out

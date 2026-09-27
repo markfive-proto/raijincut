@@ -1,5 +1,6 @@
-/target/
 __pycache__/
+*.egg-info/
+build/
 
 # local test runs: third-party media, frames and transcripts
 samples/
