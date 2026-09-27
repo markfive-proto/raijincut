@@ -125,6 +125,10 @@ def global_motion(sa, sb):
 
 def _shape(p):
     """Easing of one speed pulse (normalised to peak 1): where its mass sits and how flat its top is."""
+    m = max(p)
+    if m <= 0:
+        return "instant", 0.5, None, None
+    p = [x / m for x in p]
     tot = sum(p)
     c = sum(i * x for i, x in enumerate(p)) / tot / max(1, len(p) - 1)
     core = [i for i, x in enumerate(p) if x >= 0.1]
@@ -160,10 +164,18 @@ def pulses(p, dip=0.5, rise=0.08):
 
 
 def reversals(vel, rel=0.05):
-    """Sign flips of a signed velocity, ignoring samples under `rel` x its peak magnitude."""
+    """Sign flips of a signed velocity, ignoring samples under `rel` x its peak magnitude and single-sample
+    flips (phase-correlation noise); a real overshoot holds the reversed direction for 2+ samples."""
     m = max((abs(x) for x in vel), default=0)
     s = [x > 0 for x in vel if m and abs(x) >= rel * m]
-    return sum(a != b for a, b in zip(s, s[1:]))
+    runs_ = []
+    for x in s:
+        if runs_ and runs_[-1][0] == x:
+            runs_[-1][1] += 1
+        else:
+            runs_.append([x, 1])
+    kept = [r[0] for i, r in enumerate(runs_) if r[1] >= 2 or i == 0]
+    return sum(a != b for a, b in zip(kept, kept[1:]))
 
 
 def classify_easing(v, fps=10, vel=None):
@@ -336,6 +348,40 @@ def shot_motion(shot, sig, fps, onsets):
 
 # ---------------------------------------------------------------- transitions
 
+def soft_transitions(sig, fps, taken):
+    """Animated transitions the hard-cut detector misses (motion design rarely hard-cuts): a short burst where
+    most of the frame changes, i.e. coverage peaks at >= 0.5 and averages under half that 0.3-0.5 s either side."""
+    cov, e, out = sig["coverage"], sig["energy"], []
+    for k in range(1, len(cov)):
+        c = cov[k]
+        if c < 0.5 or e[k] < 8 or c < max(cov[max(1, k - 2):k + 3]):
+            continue
+        side = [cov[j] for j in (k - 5, k - 4, k - 3, k + 3, k + 4, k + 5) if 1 <= j < len(cov)]
+        t = round((k - 0.5) / fps, 3)
+        if side and statistics.mean(side) < 0.5 * c and all(abs(t - x) >= 0.4 for x in taken + [o["t"] for o in out]):
+            out.append({"t": t, "type": "soft_cut", "confidence": 0.6, "score": round(c, 3)})
+    return out
+
+
+def split_long(bounds, sig, fps, duration, max_len=4.0):
+    """Split shots longer than max_len at their quietest sample in the middle half (type "continuous"), so every
+    strip the vision pass sees covers at most max_len seconds with 8 frames."""
+    add = []
+
+    def split(a, b):
+        ks = [k for k in range(1, len(sig["energy"])) if a + (b - a) * 0.25 <= k / fps <= a + (b - a) * 0.75]
+        if b - a <= max_len or not ks:
+            return
+        t = round(min(ks, key=lambda k: sig["energy"][k]) / fps, 3)
+        add.append({"t": t, "type": "continuous", "confidence": 1.0, "score": 0.0})
+        split(a, t)
+        split(t, b)
+    edges = [0.0] + [b["t"] for b in bounds] + [duration]
+    for a, b in zip(edges, edges[1:]):
+        split(a, b)
+    return add
+
+
 def transition(video, b, i, out, info, onsets, half=0.5, wfps=30, cell=160, cols=10):
     """30 fps frames from t-half to t+half: a labelled sheet (transitions/cutNNN.jpg) and a computed type."""
     td = os.path.join(out, "transitions")
@@ -363,7 +409,7 @@ def transition(video, b, i, out, info, onsets, half=0.5, wfps=30, cell=160, cols
     blur = min(ratio(sh[max(0, c - 3):c], sh[:5]), ratio(sh[c:c + 4], sh[-5:]))
     active = sum(1 for x in d if x > 0.3 * max(d)) if max(d) > 0 else 0
     det = b["type"]
-    if det != "cut":
+    if det not in ("cut", "soft_cut"):
         computed = det
     elif zoom >= 0.02:
         computed = "zoom_through"
@@ -374,7 +420,7 @@ def transition(video, b, i, out, info, onsets, half=0.5, wfps=30, cell=160, cols
     elif active >= 4:
         computed = "animated"     # a multi-frame change that is not a blend: wipe, push, morph (vision names it)
     else:
-        computed = "cut"
+        computed = "cut" if det == "cut" else "animated"
     return {"index": i, "t": b["t"], "detected": det, "computed": computed, "confidence": b["confidence"],
             "metrics": {"peak_diff": round(max(d), 2), "changing_frames": active, "max_speed": round(speed, 3),
                         "max_zoom": round(zoom, 3), "blur_ratio": round(blur, 2),
@@ -485,7 +531,7 @@ def vision_pass(backend, shots, transitions, out, batch=4):
             tr = by_t.get(s.get("transition_out"))
             if s.get("strip"):
                 imgs.append((f"Shot {s['index']} strip ({az.ts(s['start'])}-{az.ts(s['end'])}, {s['duration']:.2f}s)", s["strip"]))
-            if tr:
+            if tr and tr["sheet"]:
                 imgs.append((f"Shot {s['index']} to {s['index'] + 1} transition sheet (cut at {az.ts(tr['t'])})", tr["sheet"]))
             sig.append(compact_signals(s, tr))
         if not imgs:
@@ -518,7 +564,7 @@ def summarize(shots, transitions, duration):
     out = {"easing_main_events": count(e["easing"] for e in mains), "easing_all_events": count(e["easing"] for e in evs),
            "event_kinds": count(e["kind"] for e in evs), "event_duration_median_s": med(e["duration"] for e in evs),
            "stagger_median_s": med(e["stagger_s"] for e in evs), "camera": count(c for s in shots for c in s["motion"]["camera"]),
-           "transitions_computed": count(t["computed"] for t in transitions),
+           "transitions_computed": count(t["computed"] for t in transitions if t["computed"] != "continuous"),
            "hold_ratio": round(sum(h[1] - h[0] for s in shots for h in s["motion"]["holds"]) / duration, 2) if duration else 0}
     vs = [s["vision"] for s in shots if isinstance(s.get("vision"), dict)]
     if vs:
@@ -598,7 +644,9 @@ def markdown(m):
             if vi.get("notes"):
                 L.append(f"- Rebuild: {vi['notes']}")
         t = tr.get(s.get("transition_out"))
-        if t:
+        if t and t["computed"] == "continuous":
+            L.append(f"- Continues into the next segment at {az.ts(t['t'])} (long shot split for analysis, no cut)")
+        elif t:
             vt = (vi.get("transition_out") or {}) if isinstance(vi.get("transition_out"), dict) else {}
             L.append(f"- Transition out at {az.ts(t['t'])}: computed {t['computed']}"
                      + (f", vision {vt.get('type')} ({vt.get('duration_s')}s): {vt.get('evidence', '')}" if vt else "")
@@ -634,9 +682,6 @@ def analyze_motion(video, out_dir=".", vision="auto", scene_threshold=0.3, dense
 
     az.log("[1/5] shots")
     bounds = az.detect_boundaries(az.frame_stats(video, tmp), info["fps"] or 30, scene_threshold, g=az.thumbs(video))
-    shots = az.build_shots(bounds, info["duration_s"])
-    m["pacing"] = az.pacing(shots, info["duration_s"])
-    az.log(f"  {len(shots)} shots")
 
     az.log("[2/5] audio onsets")
     onsets = []
@@ -647,6 +692,11 @@ def analyze_motion(video, out_dir=".", vision="auto", scene_threshold=0.3, dense
     sig = dense_pass(video, out, dense_fps, dense_width)
     m["signals"] = {"fps": dense_fps, "note": "sample k is at k/fps; values describe the change from sample k-1",
                     **{k: v for k, v in sig.items() if k != "sharpness"}}
+    bounds = sorted(bounds + soft_transitions(sig, dense_fps, [b["t"] for b in bounds]), key=lambda b: b["t"])
+    m["pacing"] = az.pacing(az.build_shots(bounds, info["duration_s"]), info["duration_s"])
+    bounds = sorted(bounds + split_long(bounds, sig, dense_fps, info["duration_s"]), key=lambda b: b["t"])
+    shots = az.build_shots(bounds, info["duration_s"])
+    az.log(f"  {m['pacing']['shot_count']} shots ({m['pacing']['cut_count']} cuts incl. soft), {len(shots)} segments")
     for i, s in enumerate(shots):
         s["motion"] = shot_motion(s, sig, dense_fps, onsets)
         s["strip"] = shot_strip(s, out, dense_fps)
@@ -654,11 +704,13 @@ def analyze_motion(video, out_dir=".", vision="auto", scene_threshold=0.3, dense
 
     az.log(f"[4/5] transitions ({len(bounds)} cuts, 30 fps windows)")
     shutil.rmtree(os.path.join(out, "transitions"), ignore_errors=True)
-    m["transitions"] = [transition(video, b, i + 1, out, info, onsets) for i, b in enumerate(bounds)]
+    m["transitions"] = [transition(video, b, i + 1, out, info, onsets) if b["type"] != "continuous" else
+                        {"index": i + 1, "t": b["t"], "detected": "continuous", "computed": "continuous", "confidence": 1.0,
+                         "metrics": {}, "sheet": None, "on_onset": near(b["t"], onsets)} for i, b in enumerate(bounds)]
     evs = [e for s in shots for e in s["motion"]["events"]]
     dur = info["duration_s"] or 1
     m["audio"] = {"status": "ok", "onsets": onsets, "onsets_per_s": round(len(onsets) / dur, 2),
-                  "cuts_on_onset": sum(t["on_onset"] for t in m["transitions"]),
+                  "cuts_on_onset": sum(t["on_onset"] for t in m["transitions"] if t["sheet"]),
                   "events_on_onset": sum(e["on_onset"] for e in evs), "event_count": len(evs),
                   "chance_ratio": round(min(1.0, len(onsets) / dur * 2 * SYNC_S), 2)} if info["has_audio"] else {"status": "no_audio"}
 
