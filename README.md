@@ -18,7 +18,7 @@ Design rules:
 | Command | What it does |
 |---|---|
 | `download` | Download a video (YouTube, X, Facebook, LinkedIn) as mp4 + metadata JSON; optional browser cookies |
-| `analyze` | Break a video (file or URL) down: word-level transcript + SRT, shots and transitions, pacing, keyframes, contact sheet, vision notes, audio/SFX hits, caption style, `breakdown.json` + `breakdown.md` |
+| `analyze` | Break a video (file or URL) down: word-level transcript + SRT, shots and transitions, pacing, keyframes, contact sheet, vision notes, audio/SFX hits, caption style, `breakdown.json` + `breakdown.md`. `--mode motion`: dense frames, per-shot easing, camera, holds, transition sheets, animation specs, `motion.json` + `motion.md` |
 | `probe` | Duration, resolution, audio codec |
 | `cut` | Cut a segment by start/end (frame accurate, re-encodes) |
 | `crop` | Centre-crop to any `W:H` aspect ratio |
@@ -185,6 +185,109 @@ Heuristics worth knowing: SFX hits are level jumps, so speech plosives and sibil
 the median level, so a noisy room can read as music. Detected transitions come from pixels; the vision
 pass gives a second opinion in `vision.transition_in`.
 
+### Motion mode: how a video animates
+
+```bash
+raijincut analyze ./downloads/launch.mp4 -o ./breakdowns --mode motion --vision claude-cli
+raijincut analyze ./downloads/launch.mp4 -o ./breakdowns --mode motion --dense-fps 15 --vision none
+```
+
+For motion-design references (SaaS launch films, product reels): what moves, how far, how long, with
+which easing, how the camera moves and how each shot hands over to the next. No transcript. Output in
+`<output>/<slug>/`:
+
+| File | What |
+|---|---|
+| `motion.md` | Per video: computed easing, camera, transition and sound-sync stats, then per shot the computed moves and (with vision) an animation spec table |
+| `motion.json` | All data, schema below |
+| `dense/fNNNNN.jpg` | Every frame at `--dense-fps` (default 10), 480 px wide; frame `fK` is at `(K-1)/fps` s |
+| `strips/shotNNN.jpg` | Up to 8 dense frames spread over the shot, labelled with the time from the shot start |
+| `transitions/cutNNN.jpg` | 30 frames at 30 fps from 0.5 s before to 0.5 s after cut NNN, labelled in ms, the first frame after the cut outlined red |
+
+How the numbers are made (all computed from pixels, no guessing):
+
+- **Energy**: mean absolute difference between consecutive 64 px gray frames at `--dense-fps`. Holds are
+  runs under 0.5 (or 10% of the shot's peak move) of at least 0.3 s; the rest is split into motion events.
+- **Global motion**: phase correlation between consecutive 64 px frames (pure Python FFT) gives the shift;
+  the divergence of the four quadrant shifts gives the scale change (it reads about a fifth low). An event is a
+  `camera` move when the whole frame moves (quadrants agree and at least 20% of pixels change) or scales, a
+  `fade` when the luma change explains the difference, else an `element` move.
+- **Easing**: the event's speed curve (phase correlation speed when it locks on, else energy) is split into
+  pulses. One pulse: flat top = `linear`, mass early = `ease-out`, late = `ease-in`, bell = `ease-in-out`.
+  Decaying pulses or a direction flip = `overshoot` (2) or `bounce` (3+); similar pulses = `staggered <ease>`
+  with the spacing as `stagger_s`. `confidence` is a heuristic 0-1.
+- **Transitions**: the breakdown detector (cut, dissolve, fade through black, white flash), then for hard cuts
+  the 30 fps window decides `zoom_through` (scale change next to the cut), `whip` (fast shift), `blur`
+  (sharpness dip), `animated` (4+ changing frames that are not a blend: a wipe, push or morph) or `cut`.
+- **Sound sync**: audio onsets (10 dB level jumps) within 100 ms of a cut or a move start, with the chance
+  rate for that onset density.
+- **Vision** (`--vision claude-cli|api|ollama`, `--vision-batch 4` shots per call): the strip, the transition
+  sheet and the computed signals go in; per shot it returns elements, animations (element, property,
+  direction, from, to, start, duration, stagger, easing), camera, transition out, typography, UI presentation,
+  background, effects and sound sync.
+
+Self-check (`tests/test_raijincut.py`): a lavfi clip with a card sliding in on a cubic ease-out, a linear pan, an
+eased zoom, a hard cut and a fade through black; all 9 checks (shots, easings, move kind, camera, transitions)
+must pass. A 60 s 1080p video takes about a minute before vision; Python stays under 100 MB.
+
+#### `motion.json` schema (version 1)
+
+```jsonc
+{
+  "schema_version": 1, "mode": "motion", "generated_at": "2026-09-27T09:00:00",
+  "source": { /* as in breakdown.json */ },
+  "settings": {"dense_fps": 10, "dense_width": 480, "signal_size": 64, "window_s": 0.5, "window_fps": 30, "scene_threshold": 0.3},
+  "pacing": { /* as in breakdown.json */ },
+  "signals": {"fps": 10, "energy": [0.0, 3.7], "coverage": [], "luma": [], "dluma": [], "dx": [], "dy": [],
+              "zoom": [], "pc_peak": [], "agree": []},   // sample k is at k/fps, values describe the change from k-1
+  "audio": {"status": "ok|no_audio", "onsets": [1.23], "onsets_per_s": 1.5, "cuts_on_onset": 4,
+            "events_on_onset": 9, "event_count": 30, "chance_ratio": 0.3},
+  "transitions": [{"index": 1, "t": 2.5, "detected": "cut|dissolve|fade_black|cut_to_black|flash_white",
+                   "computed": "cut|zoom_through|whip|blur|animated|dissolve|fade_black|cut_to_black|flash_white",
+                   "confidence": 0.9, "on_onset": true, "sheet": "transitions/cut001.jpg",
+                   "metrics": {"peak_diff": 113.7, "changing_frames": 1, "max_speed": 0.01, "max_zoom": 0.0, "blur_ratio": 0.9, "luma_min": 46.5}}],
+  "shots": [{
+    "index": 1, "start": 0.0, "end": 2.5, "duration": 2.5, "transition_in": {"detected": "start", "confidence": 1.0},
+    "transition_out": 1,                                   // index into transitions, null for the last shot
+    "strip": "strips/shot001.jpg", "dense_frames": ["dense/f00001.jpg", "dense/f00025.jpg"],
+    "motion": {
+      "camera": ["static|pan_left|pan_right|tilt_up|tilt_down|zoom_in|zoom_out"],
+      "holds": [[1.2, 2.4]], "hold_ratio": 0.48, "energy_peak": 13.2, "energy_mean": 3.1, "samples": 24,
+      "main_event": 0,                                     // biggest non-fade move
+      "events": [{"start": 0.4, "end": 1.2, "duration": 0.8, "peak_t": 0.7,
+                  "kind": "element|camera|fade", "direction": "left|right|up|down|in|out|n/a",
+                  "travel": [0.55, 0.0],                   // content shift as fractions of frame width, height
+                  "scale": 1.0, "agree": 0.25, "coverage": 0.04, "energy": 64.9,
+                  "speed_source": "phase_correlation|energy",
+                  "easing": "linear|ease-out|ease-in|ease-in-out|overshoot|bounce|staggered <ease>|instant",
+                  "confidence": 0.86, "pulses": 1, "stagger_s": null, "centroid": 0.27, "plateau": 0.29,
+                  "on_onset": false}]
+    },
+    "vision": {                                            // null without a vision backend
+      "shot": 1, "role": "hook|problem|solution|demo|feature|social_proof|cta|brand|transition|other",
+      "elements": ["..."],
+      "animations": [{"element": "...", "property": "position|scale|opacity|blur|rotation|mask|clip|colour|3d|path|text|counter",
+                      "direction": "...", "from": "...", "to": "...", "start_s": 0.4, "duration_s": 0.8,
+                      "stagger_s": null, "easing": "..."}],
+      "camera": {"move": "static|push_in|pull_out|pan|tilt|orbit|dolly|parallax|shake|rack_focus", "direction": "...", "amount": "...", "easing": "..."},
+      "transition_out": {"type": "cut|match_cut|whip|zoom_through|mask_wipe|morph|push|slide|dissolve|fade|blur|light_leak|flash|glitch|none",
+                         "duration_s": 0.3, "evidence": "..."},
+      "typography": {"present": true, "text": ["..."], "weight": "...", "size_class": "hero|headline|body|label|none",
+                     "kinetic": "none|word_by_word|char_cascade|mask_reveal|scale_pop|typewriter|highlight|counter|other"},
+      "ui_presentation": "real_screen_recording|rebuilt_ui|device_mockup|3d_device|illustration|live_action|none",
+      "background": {"type": "flat|gradient|mesh_gradient|glow|glass|grid|photo|video|3d", "colours": ["..."], "motion": "..."},
+      "effects": ["..."], "sound_sync": "...", "notes": "..."
+    }
+  }],
+  "vision": {"backend": "claude-cli|api|ollama|none", "status": "ok|skipped|failed"},
+  "summary": {"easing_main_events": {"ease-out": 12}, "easing_all_events": {}, "event_kinds": {}, "event_duration_median_s": 0.6,
+              "stagger_median_s": 0.1, "camera": {}, "transitions_computed": {}, "hold_ratio": 0.3,
+              "vision": {"roles": [], "transitions": {}, "camera": {}, "animation_properties": {}, "animation_easing": {},
+                         "animation_duration_median_s": 0.5, "animation_stagger_median_s": 0.08, "ui_presentation": {},
+                         "background": {}, "kinetic_type": {}, "effects": {}}}
+}
+```
+
 ### Rough cut (filler words, repeats, pauses)
 
 ```bash
@@ -248,6 +351,7 @@ TOML files in `raijincut/presets/` define resolution, aspect ratio, fps, duratio
 raijincut/
 ├── cli.py        # argparse entry point; download, probe, cut, crop, convert, subtitle, repurpose, presets
 ├── analyze.py    # analyze: transcript, shots, keyframes, vision, audio, breakdown (+ shared SRT/whisper helpers)
+├── motion.py     # analyze --mode motion: dense frames, energy, phase correlation, easing, transitions, motion.json/md
 ├── roughcut.py   # rough-cut: plan edits from a transcript, one ffmpeg trim/concat pass
 └── presets/      # platform presets (TOML)
 tests/test_raijincut.py   # one self-check per command on ffmpeg lavfi samples

@@ -152,6 +152,66 @@ def test_analyze():
     assert b["pacing"]["shot_count"] == 2 and os.path.exists(os.path.join(TMP, "cuts", "breakdown.md"))
 
 
+def test_phase_corr_and_easing():
+    from raijincut import motion as mo
+    tex = [[(x * 7 + y * 13 + (x * y) % 17) % 256 for x in range(80)] for y in range(80)]
+    a = bytes(tex[8 + y][8 + x] for y in range(mo.N) for x in range(mo.N))
+    b = bytes(tex[10 + y][5 + x] for y in range(mo.N) for x in range(mo.N))   # content moves +3 px x, -2 px y
+    dx, dy, _, peak, _ = mo.global_motion(mo.spectra(a), mo.spectra(b))
+    assert round(dx) == 3 and round(dy) == -2 and peak > 0.3, (dx, dy, peak)
+    curves = {"ease-out": lambda t: 1 - (1 - t) ** 3, "linear": lambda t: t, "ease-in": lambda t: t * t,
+              "ease-in-out": lambda t: 2 * t * t if t < .5 else 1 - (2 - 2 * t) ** 2 / 2,
+              "overshoot": lambda t: 1 + 2.70158 * (t - 1) ** 3 + 1.70158 * (t - 1) ** 2}
+    for want, f in curves.items():
+        vel = [0] + [f((i + 1) / 10) - f(i / 10) for i in range(10)] + [0]
+        got = mo.classify_easing([abs(v) for v in vel], 10, vel)["easing"]
+        assert got == want, (want, got)
+    assert mo.classify_easing([0, 1, 0.3, 0, 1, 0.3, 0, 1, 0.3, 0])["easing"].startswith("staggered")
+
+
+def motion_sample():
+    """Three shots with known motion: a card sliding in with a cubic ease-out, a linear pan, an eased zoom.
+    Shot 1 to 2 is a hard cut, shot 2 to 3 a fade through black."""
+    src = os.path.join(TMP, "motion.mp4")
+    tex = os.path.join(TMP, "tex.png")
+    sh("ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "mandelbrot=s=1280x720", "-frames:v", "1", tex)
+    u = "clip((on/30-0.4)/1.8,0,1)"
+    fc = ("color=c=0x1e1e2e:s=640x360:r=30:d=2.5[bg];color=c=white:s=160x100:r=30:d=2.5[card];"
+          "[bg][card]overlay=x='if(lt(t,0.5),-160,-160+400*(1-pow(1-min(t-0.5,1),3)))':y=130,setsar=1,format=yuv420p[a];"
+          "[1:v]crop=640:360:x='60+min(t,2)*160':y=180,fade=t=out:st=2.1:d=0.4,setsar=1,format=yuv420p[b];"
+          f"[2:v]zoompan=z='1+0.6*(3*pow({u},2)-2*pow({u},3))':d=1:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=640x360:fps=30,"
+          "fade=t=in:st=0:d=0.3,setsar=1,format=yuv420p[c];[a][b][c]concat=n=3:v=1[v]")
+    sh("ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "nullsrc=s=16x16:d=0.1",
+       "-loop", "1", "-framerate", "30", "-t", "2.5", "-i", tex, "-loop", "1", "-framerate", "30", "-t", "2.8", "-i", tex,
+       "-filter_complex", fc, "-map", "[v]", "-c:v", "libx264", "-pix_fmt", "yuv420p", src)
+    return src
+
+
+def test_analyze_motion():
+    rc("analyze", motion_sample(), "-o", TMP, "--mode", "motion", "--vision", "none")
+    m = json.load(open(os.path.join(TMP, "motion", "motion.json")))
+    shots, trs = m["shots"], m["transitions"]
+    main = [s["motion"]["events"][s["motion"]["main_event"]] if s["motion"]["main_event"] is not None else {} for s in shots]
+    checks = {  # name: (want, got)
+        "shot count": (3, len(shots)),
+        "slide easing": ("ease-out", main[0].get("easing")),
+        "slide is an element moving right": (("element", "right"), (main[0].get("kind"), main[0].get("direction"))),
+        "pan easing": ("linear", main[1].get("easing")) if len(main) > 1 else ("linear", None),
+        "pan camera": (["pan_right"], shots[1]["motion"]["camera"]) if len(shots) > 1 else (["pan_right"], None),
+        "zoom easing": ("ease-in-out", main[2].get("easing")) if len(main) > 2 else ("ease-in-out", None),
+        "zoom camera": (["zoom_in"], shots[2]["motion"]["camera"]) if len(shots) > 2 else (["zoom_in"], None),
+        "hard cut": ("cut", trs[0]["computed"] if trs else None),
+        "fade": ("fade_black", trs[1]["computed"] if len(trs) > 1 else None),
+    }
+    ok = sum(want == got for want, got in checks.values())
+    print(f"    motion self-check: {ok}/{len(checks)} correct")
+    for name, (want, got) in checks.items():
+        print(f"    {'ok ' if want == got else 'BAD'} {name}: want {want}, got {got}")
+    assert ok == len(checks)
+    for f in ("motion.md", "strips/shot001.jpg", "transitions/cut001.jpg", "dense/f00001.jpg"):
+        assert os.path.exists(os.path.join(TMP, "motion", f)), f
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

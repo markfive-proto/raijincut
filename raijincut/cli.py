@@ -270,6 +270,11 @@ def main(argv=None):
     c.add_argument("--scene-threshold", type=float, default=0.3, help="hard-cut scene score threshold (lower = more cuts)")
     c.add_argument("--cookies-from-browser", metavar="BROWSER")
     c.add_argument("--no-summary", action="store_true", help="skip the LLM summary call")
+    c.add_argument("--mode", default="breakdown", choices=["breakdown", "motion"],
+                   help="breakdown (default): transcript, shots, audio, captions. motion: dense frames, easing, camera, "
+                        "transitions -> motion.json/.md")
+    c.add_argument("--dense-fps", type=float, default=10, help="motion mode: sample rate for dense frames and signals")
+    c.add_argument("--vision-batch", type=int, default=4, help="motion mode: shots per vision call")
     sp.add_parser("presets", help="list platform presets")
     a = ap.parse_args(argv)
 
@@ -296,6 +301,10 @@ def main(argv=None):
         repurpose(a.input, a.preset, a.clips, a.subtitles, a.output, a.whisper_model)
     elif a.cmd == "analyze":
         video = download(a.input, a.output, a.cookies_from_browser) if is_url(a.input) else a.input
-        az.analyze(video, a.output, a.whisper_model, a.vision, a.scene_threshold, a.no_summary)
+        if a.mode == "motion":
+            from .motion import analyze_motion
+            analyze_motion(video, a.output, a.vision, a.scene_threshold, a.dense_fps, vision_batch=a.vision_batch)
+        else:
+            az.analyze(video, a.output, a.whisper_model, a.vision, a.scene_threshold, a.no_summary)
     elif a.cmd == "presets":
         print(list_presets())
