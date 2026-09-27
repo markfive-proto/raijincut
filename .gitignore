@@ -1,2 +1,5 @@
 /target/
 __pycache__/
+
+# local test runs: third-party media, frames and transcripts
+samples/

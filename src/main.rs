@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 #[derive(Parser)]
-#[command(name = "raijincut", about = "Parallel video processing CLI — thunder-fast editing powered by Rust")]
+#[command(name = "raijincut", about = "Parallel video processing CLI: thunder-fast editing powered by Rust")]
 struct Cli {
     #[command(subcommand)]
     cmd: Commands,
@@ -40,12 +40,29 @@ enum Commands {
         #[arg(help = "Input video file")]
         input: String,
     },
-    /// Download a video from a URL
+    /// Download a video (YouTube, X, Facebook, LinkedIn, ...) as mp4 plus a metadata JSON
     Download {
         #[arg(help = "Video URL to download")]
         url: String,
-        #[arg(short, long, help = "Output directory")]
+        #[arg(short, long, default_value = ".", help = "Output directory")]
         output: String,
+        #[arg(long, value_name = "BROWSER", help = "Reuse your signed-in browser session, e.g. chrome (needed for most LinkedIn/X/Facebook posts)")]
+        cookies_from_browser: Option<String>,
+    },
+    /// Break a video down: transcript, shots, keyframes, vision notes, audio hits, captions, breakdown.md/json
+    Analyze {
+        #[arg(help = "Video file, or a URL to download first")]
+        input: String,
+        #[arg(short, long, default_value = ".", help = "Output directory (results go to <output>/<slug>/)")]
+        output: String,
+        #[arg(long, env = "RAIJINCUT_WHISPER_MODEL", help = "whisper.cpp ggml model file; without it, mlx_whisper is tried")]
+        whisper_model: Option<String>,
+        #[arg(long, default_value = "auto", help = "Vision backend: auto (API key, then ollama), api, ollama, claude-cli, none")]
+        vision: String,
+        #[arg(long, default_value = "0.3", help = "Hard-cut scene score threshold (lower = more cuts)")]
+        scene_threshold: f32,
+        #[arg(long, value_name = "BROWSER", help = "When input is a URL: reuse your signed-in browser session, e.g. chrome")]
+        cookies_from_browser: Option<String>,
     },
     /// Cut a segment from a video (start/end timestamps)
     Cut {
@@ -130,7 +147,16 @@ fn main() {
             batch_transcribe(&url_list, &output, diarize, jobs)
         }
         Commands::Probe { input } => probe(&input),
-        Commands::Download { url, output } => download(&url, &output),
+        Commands::Download { url, output, cookies_from_browser } => {
+            if let Err(e) = try_download(&url, &output, cookies_from_browser.as_deref()) {
+                exit_err(&e);
+            }
+        }
+        Commands::Analyze { input, output, whisper_model, vision, scene_threshold, cookies_from_browser } => {
+            if let Err(e) = analyze(&input, &output, whisper_model.as_deref(), &vision, scene_threshold, cookies_from_browser.as_deref()) {
+                exit_err(&e);
+            }
+        }
         Commands::Cut { input, start, end, output } => cut(&input, &start, &end, &output),
         Commands::Crop { input, output, aspect } => crop(&input, &output, &aspect),
         Commands::Subtitle { input, srt, output } => subtitle(&input, &srt, &output),
@@ -230,6 +256,10 @@ fn find_python_dir() -> PathBuf {
                 return beside_exe;
             }
         }
+    }
+    let in_repo = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/python"));
+    if in_repo.exists() {
+        return in_repo;
     }
     relative
 }
@@ -451,21 +481,88 @@ fn probe(input: &str) {
 
 // ============== Download ==============
 
-fn download(url: &str, output: &str) {
-    println!("Downloading (max 1080p): {}", url);
-    let out_template = format!("{}/%(title)s.%(ext)s", output);
-    match run_cmd(
-        "yt-dlp",
-        &[
-            "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
-            "--merge-output-format", "mp4",
-            "-o", &out_template,
-            url,
-        ],
-    ) {
-        Ok(_) => println!("Downloaded to: {}", output),
-        Err(e) => exit_err(&e),
+/// Fields kept from yt-dlp's info dict. `filepath` is the final merged file.
+const META_FIELDS: &str = "id,title,uploader,channel,webpage_url,extractor_key,duration,view_count,like_count,comment_count,upload_date,description,filepath";
+
+/// Downloads `url` into `output` and writes `<video>.json` next to it. Returns the video path.
+fn try_download(url: &str, output: &str, cookies_from_browser: Option<&str>) -> Result<PathBuf, String> {
+    fs::create_dir_all(output).map_err(|e| format!("Cannot create {}: {}", output, e))?;
+    println!("Downloading: {}", url);
+    let template = format!("{}/%(title).60B-%(id)s.%(ext)s", output);
+    let print = format!("after_move:%(.{{{}}})j", META_FIELDS);
+    let mut args = vec![
+        "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
+        "--merge-output-format", "mp4", "--restrict-filenames", "--no-playlist",
+        "-o", &template, "--no-simulate", "--print", &print,
+    ];
+    if let Some(browser) = cookies_from_browser {
+        args.extend(["--cookies-from-browser", browser]);
     }
+    args.push(url);
+
+    let out = Command::new("yt-dlp").args(&args).output().map_err(|e| format!("Failed to run yt-dlp: {}", e))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let lower = err.to_lowercase();
+        let login_wall = ["login", "log in", "sign in", "cookies", "authentication", "private", "registered users", "not available"]
+            .iter()
+            .any(|k| lower.contains(k));
+        // logged-out LinkedIn/Facebook/X pages often fail as "unable to extract" rather than "login"
+        let social = ["linkedin.com", "facebook.com", "fb.watch", "x.com", "twitter.com", "instagram.com"]
+            .iter()
+            .any(|h| url.contains(h));
+        if login_wall || social {
+            let hint = if cookies_from_browser.is_some() {
+                "The browser session did not unlock it. Open the post in that browser while signed in, then retry."
+            } else {
+                "Sign in to the site in Chrome yourself, then rerun with --cookies-from-browser chrome."
+            };
+            return Err(format!("This post probably needs a logged-in session. {}\n(raijincut never asks for or stores passwords.)\n\n{}", hint, err.trim()));
+        }
+        return Err(format!("yt-dlp failed:\n{}", err.trim()));
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout.lines().rev().find(|l| l.trim_start().starts_with('{')).ok_or("yt-dlp printed no metadata")?;
+    let mut meta: serde_json::Value = serde_json::from_str(line).map_err(|e| format!("Bad metadata JSON: {}", e))?;
+    let video = PathBuf::from(meta["filepath"].as_str().ok_or("yt-dlp did not report the file path")?);
+    meta["source_url"] = serde_json::Value::String(url.to_string());
+    let meta_path = video.with_extension("json");
+    fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap_or_default())
+        .map_err(|e| format!("Cannot write {}: {}", meta_path.display(), e))?;
+    println!("Video:    {}", video.display());
+    println!("Metadata: {}", meta_path.display());
+    Ok(video)
+}
+
+// ============== Analyze ==============
+
+fn analyze(
+    input: &str,
+    output: &str,
+    whisper_model: Option<&str>,
+    vision: &str,
+    scene_threshold: f32,
+    cookies_from_browser: Option<&str>,
+) -> Result<(), String> {
+    let video = if input.starts_with("http://") || input.starts_with("https://") {
+        try_download(input, output, cookies_from_browser)?
+    } else {
+        PathBuf::from(input)
+    };
+    let script = path_str(&find_python_dir().join("analyze.py"));
+    let video_s = path_str(&video);
+    let threshold = scene_threshold.to_string();
+    let mut args = vec![script.as_str(), video_s.as_str(), "-o", output, "--vision", vision, "--scene-threshold", &threshold];
+    if let Some(m) = whisper_model {
+        args.extend(["--whisper-model", m]);
+    }
+    // inherit stdio so progress streams live
+    let status = Command::new("python3").args(&args).status().map_err(|e| format!("Failed to run python3: {}", e))?;
+    if !status.success() {
+        return Err(format!("analyze.py exited with {}", status));
+    }
+    Ok(())
 }
 
 // ============== Cut ==============
@@ -687,6 +784,10 @@ fn find_presets_dir() -> std::path::PathBuf {
                 return beside_exe;
             }
         }
+    }
+    let in_repo = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/presets"));
+    if in_repo.exists() {
+        return in_repo;
     }
     relative
 }
