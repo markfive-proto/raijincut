@@ -21,6 +21,9 @@ Pure Python package `raijincut/`, entry point `raijincut.cli:main` (argparse).
   works on ffmpeg builds without libass/drawtext.
 - `analyze.py`: the `analyze` breakdown (transcript, shots, keyframes, vision, audio, summary). Also holds the
   shared helpers `transcribe_video`, `group_words`, `write_srt`, `parse_srt`.
+- `motion.py`: `analyze --mode motion` (dense 10 fps frames, energy curve, phase-correlation pan/zoom in pure
+  Python, easing classifier, 30 fps transition windows, motion vision prompt). Reuses analyze.py's shot detector,
+  audio onsets and vision `ask()`. `motion.json` schema in README.md; bump its `SCHEMA_VERSION` on change.
 - `roughcut.py`: `rough-cut`, transcript-driven removal of fillers, repeats and long pauses. It is the single
   implementation; solopreneur video-studio's `cleanup` tool shells out to it.
 - `presets/*.toml`: platform presets (`[video]`, `[subtitle]`), shipped as package data.

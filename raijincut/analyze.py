@@ -178,7 +178,7 @@ def mad(a, b):
     return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
 
 
-def find_dissolves(frames, fps, taken, step=2):
+def find_dissolves(frames, fps, taken, step=2, spans=()):
     """A crossfade's middle frame is the average of the frames either side of it; fast motion is not.
     ffmpeg's scene score stays near 0 during a steady crossfade, so this looks at pixels instead.
     `frames` is any iterable of gray thumbnails; only a 2*K+1 frame window is kept (K = 0.5 s).
@@ -196,7 +196,7 @@ def find_dissolves(frames, fps, taken, step=2):
             if c < k or (c - k) % step:
                 continue
             t = c / fps
-            if any(abs(t - x) <= k / fps + 0.1 for x in taken):
+            if any(abs(t - x) <= k / fps + 0.1 for x in taken) or any(a - k / fps <= t <= b + k / fps for a, b in spans):
                 continue
             a, m, b = win[-1 - 2 * k], win[-1 - k], f
             d_ab = mad(a, b)
@@ -223,7 +223,7 @@ def detect_boundaries(frames, fps, thr=0.3, min_shot=0.25, g=None):
     - dissolve: pixel blend test on gray thumbnails `g`, any iterable (see find_dissolves).
     ponytail: fixed heuristic thresholds; the vision pass double-checks every transition.
     """
-    b = []
+    b, spans = [], []   # spans: fade ramps + runs; a fade through black is a blend too, so dissolves skip them
     s = [f["score"] for f in frames]
     y = [f["y"] for f in frames]
     n = len(frames)
@@ -248,6 +248,10 @@ def detect_boundaries(frames, fps, thr=0.3, min_shot=0.25, g=None):
             while k > 0 and ramp < 15 and ((y[k - 1] > y[k] + 1) if kind == "black" else (y[k - 1] < y[k] - 1)):
                 ramp += 1
                 k -= 1
+            up = j + 1   # the ramp back out of the run
+            while up + 1 < n and up - j < 15 and ((y[up + 1] > y[up] + 1) if kind == "black" else (y[up + 1] < y[up] - 1)):
+                up += 1
+            spans.append((frames[k]["t"], frames[up]["t"]))
             mid = (frames[i]["t"] + frames[j]["t"]) / 2
             if kind == "black":
                 add(mid, "fade_black" if ramp >= 3 else "cut_to_black", 0.8, max(s[i:j + 2]))
@@ -260,7 +264,7 @@ def detect_boundaries(frames, fps, thr=0.3, min_shot=0.25, g=None):
             add(frames[i]["t"], "cut", round(min(1.0, 0.5 + s[i]), 2), s[i])
 
     if g is not None:
-        for t, d in find_dissolves(g, fps, [x["t"] for x in b]):
+        for t, d in find_dissolves(g, fps, [x["t"] for x in b], spans=spans):
             add(t, "dissolve", 0.6, d / 255)
     return sorted(b, key=lambda x: x["t"])
 
@@ -548,6 +552,23 @@ def ask(backend, prompt, images, out):
         if r.returncode:
             raise RuntimeError(r.stderr[-500:] or r.stdout[-500:])
         return r.stdout
+    if backend == "codex-cli":   # your Codex login (ChatGPT plan); images go in with -i, labels in the prompt
+        fd, outf = tempfile.mkstemp(suffix=".txt")
+        os.close(fd)
+        cmd = ["codex", "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only", "-o", outf,
+               "-c", f'model_reasoning_effort="{os.environ.get("RAIJINCUT_CODEX_EFFORT", "medium")}"']
+        if os.environ.get("RAIJINCUT_CODEX_MODEL"):
+            cmd += ["-m", os.environ["RAIJINCUT_CODEX_MODEL"]]
+        for _, p in images:
+            cmd += ["-i", os.path.abspath(os.path.join(out, p))]
+        full = prompt + ("\n\nImages attached, in order:\n" + "\n".join(f"Image {i}: {label}" for i, (label, _) in enumerate(images, 1))
+                         if images else "")
+        r = run(cmd + ["--", full], cwd=out, timeout=900)
+        text = open(outf).read()
+        os.unlink(outf)
+        if r.returncode or not text.strip():
+            raise RuntimeError((r.stderr or r.stdout)[-500:] or "codex returned nothing")
+        return text
     if backend == "ollama":
         body = {"model": ollama_vision_model(), "prompt": prompt, "stream": False, "format": "json",
                 "images": [b64(os.path.join(out, p)) for _, p in images]}
