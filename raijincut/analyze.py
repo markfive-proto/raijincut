@@ -552,6 +552,23 @@ def ask(backend, prompt, images, out):
         if r.returncode:
             raise RuntimeError(r.stderr[-500:] or r.stdout[-500:])
         return r.stdout
+    if backend == "codex-cli":   # your Codex login (ChatGPT plan); images go in with -i, labels in the prompt
+        fd, outf = tempfile.mkstemp(suffix=".txt")
+        os.close(fd)
+        cmd = ["codex", "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only", "-o", outf,
+               "-c", f'model_reasoning_effort="{os.environ.get("RAIJINCUT_CODEX_EFFORT", "medium")}"']
+        if os.environ.get("RAIJINCUT_CODEX_MODEL"):
+            cmd += ["-m", os.environ["RAIJINCUT_CODEX_MODEL"]]
+        for _, p in images:
+            cmd += ["-i", os.path.abspath(os.path.join(out, p))]
+        full = prompt + ("\n\nImages attached, in order:\n" + "\n".join(f"Image {i}: {label}" for i, (label, _) in enumerate(images, 1))
+                         if images else "")
+        r = run(cmd + ["--", full], cwd=out, timeout=900)
+        text = open(outf).read()
+        os.unlink(outf)
+        if r.returncode or not text.strip():
+            raise RuntimeError((r.stderr or r.stdout)[-500:] or "codex returned nothing")
+        return text
     if backend == "ollama":
         body = {"model": ollama_vision_model(), "prompt": prompt, "stream": False, "format": "json",
                 "images": [b64(os.path.join(out, p)) for _, p in images]}

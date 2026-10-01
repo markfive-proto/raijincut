@@ -266,7 +266,7 @@ def main(argv=None):
     c.add_argument("input", help="video file, or a URL to download first")
     c.add_argument("-o", "--output", default=".", help="results go to <output>/<slug>/")
     c.add_argument("--whisper-model", default=os.environ.get("RAIJINCUT_WHISPER_MODEL"), help=WHISPER_HELP)
-    c.add_argument("--vision", default="auto", choices=["auto", "api", "ollama", "claude-cli", "none"])
+    c.add_argument("--vision", default="auto", choices=["auto", "api", "ollama", "claude-cli", "codex-cli", "none"])
     c.add_argument("--scene-threshold", type=float, default=0.3, help="hard-cut scene score threshold (lower = more cuts)")
     c.add_argument("--cookies-from-browser", metavar="BROWSER")
     c.add_argument("--no-summary", action="store_true", help="skip the LLM summary call")
